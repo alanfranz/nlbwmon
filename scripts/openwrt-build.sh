@@ -1,13 +1,16 @@
 #!/bin/sh
-# Build nlbwmon the way the OpenWrt 25.12 package (packages feed, net/nlbwmon) does:
-#   CMAKE_OPTIONS += -DLIBNL_LIBRARY_TINY=ON
-#   TARGET_CFLAGS += -I$(STAGING_DIR)/usr/include/libnl-tiny
+# Build nlbwmon without CMake (none is available on OpenWrt), with the
+# flags the OpenWrt 25.12 package (packages feed, net/nlbwmon) ends up
+# using: CMakeLists.txt definitions, -DLIBNL_LIBRARY_TINY=ON (link with
+# nl-tiny), the Release build type (-DNDEBUG) and the HAVE_ULOOP_INTERVAL
+# check.
 #
 # On OpenWrt: headers are taken from the router's build tree (see defaults
 # below). Elsewhere: first run scripts/openwrt-deps.sh; its prefix
 # (openwrt-deps/prefix, or DEPS_PREFIX) is picked up automatically.
 #
 # Overrides (environment):
+#   CC           compiler (default: gcc)
 #   UBOX_INC     directory containing libubox/*.h
 #   NL_TINY_INC  directory containing netlink/netlink.h from libnl-tiny
 #   LIB_DIR      extra directory holding libubox.so and libnl-tiny.so
@@ -17,6 +20,7 @@ set -e
 
 SRC=$(cd "$(dirname "$0")/.." && pwd)
 B=${1:-$SRC/build-openwrt}
+CC=${CC:-gcc}
 RPATH=
 
 if [ -f /etc/openwrt_release ]; then
@@ -43,20 +47,35 @@ if [ -n "$missing" ]; then
 	exit 1
 fi
 
-LDFLAGS_EXTRA=
-if [ -n "$LIB_DIR" ]; then
-	LDFLAGS_EXTRA="-L$LIB_DIR $RPATH"
-	# check_function_exists(uloop_interval_set) ignores CMAKE_EXE_LINKER_FLAGS
-	# under cmake_minimum_required(3.0), so point the linker at libubox here.
-	LIBRARY_PATH=$LIB_DIR${LIBRARY_PATH:+:$LIBRARY_PATH}
-	export LIBRARY_PATH
+# add_definitions() from CMakeLists.txt, then include paths and -DNDEBUG
+# (OpenWrt's CMAKE_C_FLAGS_RELEASE).
+CFLAGS="-Os -Wall -Werror --std=gnu99 -g3 -Wmissing-declarations -D_GNU_SOURCE"
+CFLAGS="$CFLAGS -I$UBOX_INC -I$NL_TINY_INC -DNDEBUG"
+LDFLAGS=
+[ -z "$LIB_DIR" ] || LDFLAGS="-L$LIB_DIR $RPATH"
+
+mkdir -p "$B"
+
+# Same probe as check_function_exists(uloop_interval_set ...): does it link?
+printf 'char uloop_interval_set(void);\nint main(void) { return uloop_interval_set(); }\n' \
+	> "$B/probe.c"
+if $CC -o "$B/probe" "$B/probe.c" $LDFLAGS -lubox >"$B/probe.log" 2>&1; then
+	CFLAGS="$CFLAGS -DHAVE_ULOOP_INTERVAL"
+	echo "-- uloop_interval_set: yes"
+else
+	echo "-- uloop_interval_set: no (see $B/probe.log)"
 fi
+rm -f "$B/probe" "$B/probe.c"
 
-cmake -S "$SRC" -B "$B" -DLIBNL_LIBRARY_TINY=ON \
-	-DCMAKE_C_FLAGS="-I$UBOX_INC -I$NL_TINY_INC" \
-	-DCMAKE_EXE_LINKER_FLAGS="$LDFLAGS_EXTRA"
+# Every top-level .c file is a source, as in the SOURCES list of CMakeLists.txt.
+objs=
+for c in "$SRC"/*.c; do
+	o=$B/$(basename "$c" .c).o
+	echo "CC $(basename "$c")"
+	$CC $CFLAGS -c -o "$o" "$c"
+	objs="$objs $o"
+done
 
-grep -q HAVE_ULOOP_INTERVAL "$B/CMakeFiles/nlbwmon.dir/flags.make" &&
-	echo "-- uloop_interval_set: yes" || echo "-- uloop_interval_set: no"
-
-make -C "$B" -j"$(nproc 2>/dev/null || echo 1)"
+echo "LD nlbwmon"
+$CC -o "$B/nlbwmon" $objs $LDFLAGS -lnl-tiny -lubox -lz
+echo "built $B/nlbwmon"
