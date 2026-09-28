@@ -13,7 +13,7 @@
 #   CC           compiler (default: gcc)
 #   UBOX_INC     directory containing libubox/*.h
 #   NL_TINY_INC  directory containing netlink/netlink.h from libnl-tiny
-#   LIB_DIR      extra directory holding libubox.so and libnl-tiny.so
+#   LIB_DIR      directory searched first for libnl-tiny, libubox and libz
 #
 # Usage: scripts/openwrt-build.sh [build-dir]    (default: build-openwrt)
 set -e
@@ -56,10 +56,38 @@ LDFLAGS=
 
 mkdir -p "$B"
 
+# OpenWrt runtime packages only ship versioned libraries (e.g.
+# /lib/libubox.so.20260213, /usr/lib/libnl-tiny.so.1), so -lubox finds
+# nothing there. Link against the library file itself instead, preferring
+# the versioned file; fall back to -lNAME if none is found.
+LIB_SEARCH=$LIB_DIR
+[ ! -f /etc/openwrt_release ] || LIB_SEARCH="$LIB_SEARCH /usr/lib /lib"
+find_lib() {
+	for d in $LIB_SEARCH; do
+		for f in "$d/lib$1.so."* "$d/lib$1.so"; do
+			[ -f "$f" ] && { echo "$f"; return; }
+		done
+	done
+	echo "-l$1"
+}
+LIB_NL=$(find_lib nl-tiny)
+LIB_UBOX=$(find_lib ubox)
+LIB_Z=$(find_lib z)
+echo "-- libraries: $LIB_NL $LIB_UBOX $LIB_Z"
+
 # Same probe as check_function_exists(uloop_interval_set ...): does it link?
+# Check that libubox links at all first, so a missing library is an error
+# rather than a silent "no".
+printf 'char uloop_init(void);\nint main(void) { return uloop_init(); }\n' \
+	> "$B/probe.c"
+if ! $CC -o "$B/probe" "$B/probe.c" $LDFLAGS "$LIB_UBOX" >"$B/probe.log" 2>&1; then
+	cat "$B/probe.log" >&2
+	echo "cannot link libubox (set LIB_DIR)" >&2
+	exit 1
+fi
 printf 'char uloop_interval_set(void);\nint main(void) { return uloop_interval_set(); }\n' \
 	> "$B/probe.c"
-if $CC -o "$B/probe" "$B/probe.c" $LDFLAGS -lubox >"$B/probe.log" 2>&1; then
+if $CC -o "$B/probe" "$B/probe.c" $LDFLAGS "$LIB_UBOX" >"$B/probe.log" 2>&1; then
 	CFLAGS="$CFLAGS -DHAVE_ULOOP_INTERVAL"
 	echo "-- uloop_interval_set: yes"
 else
@@ -77,5 +105,5 @@ for c in "$SRC"/*.c; do
 done
 
 echo "LD nlbwmon"
-$CC -o "$B/nlbwmon" $objs $LDFLAGS -lnl-tiny -lubox -lz
+$CC -o "$B/nlbwmon" $objs $LDFLAGS "$LIB_NL" "$LIB_UBOX" "$LIB_Z"
 echo "built $B/nlbwmon"
